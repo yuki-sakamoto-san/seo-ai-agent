@@ -1,0 +1,363 @@
+# agent.py
+# Gemini SEO Optimization Agent — URL + Query → SERP-aware gap analysis (global-ready)
+# Usage:
+#   pip install -r requirements.txt
+#   cp .env.example .env   # add keys
+#   python agent.py --url "https://example.com/what-is-edi" --query "EDIとは" \
+#       --hl ja --gl jp --location "Tokyo, Japan" --max-serp 10 --model "gemini-1.5-pro"
+
+import os
+import re
+import json
+import argparse
+import logging
+from typing import List, Dict, Any, Optional
+
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from dotenv import load_dotenv
+
+# Gemini
+import google.generativeai as genai
+
+# SerpAPI (official client)
+try:
+    from serpapi import GoogleSearch
+    HAS_SERPAPI = True
+except Exception:
+    HAS_SERPAPI = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ----------------------
+# Env & setup
+# ----------------------
+def read_env():
+    load_dotenv()
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Set it in your environment or .env")
+    genai.configure(api_key=gemini_key)
+    return {
+        "gemini_key": gemini_key,
+        "serpapi_key": os.getenv("SERPAPI_API_KEY"),
+    }
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+# ----------------------
+# Crawling & Extraction
+# ----------------------
+def fetch_html(url: str, timeout: int = 25) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; GeminiSEOAgent/1.0)"}
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+def extract_json_ld(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    items = []
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "{}")
+            if isinstance(data, list):
+                items.extend(data)
+            elif isinstance(data, dict):
+                items.append(data)
+        except Exception:
+            continue
+    return items
+
+def extract_headings(soup: BeautifulSoup) -> List[Dict[str, str]]:
+    out = []
+    for hn in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+        for h in soup.find_all(hn):
+            out.append({"tag": hn, "text": normalize_ws(h.get_text(" ", strip=True))})
+    return out
+
+def extract_images(soup: BeautifulSoup, base_url: str) -> List[Dict[str, str]]:
+    imgs = []
+    for img in soup.find_all("img"):
+        src = img.get("src") or ""
+        alt = img.get("alt") or ""
+        if src:
+            imgs.append({"src": urljoin(base_url, src), "alt": alt})
+    return imgs
+
+def extract_meta(soup: BeautifulSoup) -> Dict[str, Any]:
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
+    metas = {}
+    for m in soup.find_all("meta"):
+        name = m.get("name") or m.get("property")
+        content = m.get("content")
+        if name and content:
+            metas[name] = content
+    return {"title": title, "meta": metas}
+
+def extract_main_text(soup: BeautifulSoup) -> str:
+    for bad in soup(["script", "style", "nav", "footer", "noscript"]):
+        bad.decompose()
+    texts = []
+    for tag in soup.find_all(["p", "li", "blockquote"]):
+        t = normalize_ws(tag.get_text(" ", strip=True))
+        if len(t) > 30:
+            texts.append(t)
+    return "\n".join(texts)
+
+def crawl_page(url: str) -> Dict[str, Any]:
+    html = fetch_html(url)
+    soup = BeautifulSoup(html, "lxml")
+    return {
+        "url": url,
+        "meta": extract_meta(soup),
+        "headings": extract_headings(soup),
+        "images": extract_images(soup, url),
+        "json_ld": extract_json_ld(soup),
+        "text": extract_main_text(soup),
+    }
+
+# ----------------------
+# SERP Providers
+# ----------------------
+def serp_stub(query: str, num: int = 5) -> List[Dict[str, Any]]:
+    logging.warning("SERP provider is in STUB mode (set SERPAPI_API_KEY for live Google SERP).")
+    return [
+        {"title": f"{query} とは？完全ガイド", "link": "https://example.com/competitor-1", "snippet": "定義・メリット・導入手順", "position": 1},
+        {"title": f"{query} の基礎",       "link": "https://example.com/competitor-2", "snippet": "初心者向けに解説",       "position": 2},
+    ][:num]
+
+def serp_with_serpapi(
+    query: str,
+    api_key: str,
+    hl: Optional[str] = None,
+    gl: Optional[str] = None,
+    location: Optional[str] = None,
+    num: int = 10
+) -> List[Dict[str, Any]]:
+    if not HAS_SERPAPI:
+        raise RuntimeError("serpapi client not installed. pip install serpapi")
+    params = {
+        "engine": "google",
+        "q": query,
+        "api_key": api_key,
+        "num": num,
+    }
+    if hl: params["hl"] = hl
+    if gl: params["gl"] = gl
+    if location: params["location"] = location
+    search = GoogleSearch(params)
+    results = search.get_dict()
+    out = []
+    for item in results.get("organic_results", []):
+        out.append({
+            "title": item.get("title"),
+            "link": item.get("link"),
+            "snippet": item.get("snippet"),
+            "position": item.get("position"),
+        })
+    # Optional signals
+    features = {
+        "featured_snippet": bool(results.get("answer_box") or results.get("featured_snippet")),
+        "people_also_ask":  bool(results.get("people_also_ask") or results.get("related_questions")),
+        "knowledge_panel":  bool(results.get("knowledge_graph")),
+        "image_pack":       bool(results.get("inline_images")),
+        "video_results":    bool(results.get("inline_videos") or results.get("video_results")),
+        "ai_overview":      bool(results.get("ai_overview") or results.get("ai_overview_results") or
+                                 (results.get("search_information") or {}).get("ai_overview") or
+                                 (results.get("search_information") or {}).get("ai_overview_is_available"))
+    }
+    return out, features
+
+def collect_serp_anywhere(
+    query: str,
+    keys: Dict[str, Optional[str]],
+    hl: Optional[str],
+    gl: Optional[str],
+    location: Optional[str],
+    num: int
+):
+    if keys.get("serpapi_key"):
+        serp, feats = serp_with_serpapi(query, keys["serpapi_key"], hl=hl, gl=gl, location=location, num=num)
+        return serp, feats
+    return serp_stub(query, num), None
+
+# ----------------------
+# Gemini prompt & call
+# ----------------------
+SYSTEM_PROMPT = """You are an SEO Optimization Agent.
+Evaluate a source page against a primary query and top SERP competitors in the specified market.
+Return specific, prioritized, and implementable recommendations. Consider:
+- Query intent & E-E-A-T
+- Featured snippet capture (40–60 word definition), PAA coverage
+- Section order (H2/H3), comparison tables, steps/HowTo, diagrams
+- Media (images/alt, diagrams), internal/external links
+- JSON-LD/schema (FAQPage, HowTo, Breadcrumb, Article/BlogPosting, Organization/Person, SoftwareApplication/Product where applicable)
+- Japanese & global best practices (use locale-appropriate style/terminology)
+Output strict JSON only, no extra text.
+"""
+
+def recommendation_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "priority": {"type": "array", "items": {"type": "string"}},
+            "missing_elements": {"type": "array", "items": {"type": "string"}},
+            "suggested_sections": {"type": "array", "items": {"type": "string"}},
+            "reordering": {"type": "array", "items": {"type": "string"}},
+            "media": {
+                "type": "object",
+                "properties": {
+                    "images": {"type": "array", "items": {"type": "string"}},
+                    "tables": {"type": "array", "items": {"type": "string"}},
+                    "videos": {"type": "array", "items": {"type": "string"}},
+                    "diagrams": {"type": "array", "items": {"type": "string"}},
+                }
+            },
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "add": {"type": "array", "items": {"type": "string"}},
+                    "fix": {"type": "array", "items": {"type": "string"}},
+                }
+            },
+            "faq": {"type": "array", "items": {"type": "string"}},
+            "featured_snippet": {"type": "string", "description": "40–60 word inline definition tailored to the query"},
+            "internal_links": {"type": "array", "items": {"type": "string"}},
+            "external_links": {"type": "array", "items": {"type": "string"}},
+            "word_count_target": {"type": "integer"},
+            "reading_level_note": {"type": "string"},
+            "acceptance_criteria": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["priority"]
+    }
+
+def build_user_payload(page: Dict[str, Any], serp_compact: List[Dict[str, Any]], primary_query: str, market: Dict[str, Optional[str]]) -> str:
+    # Cap text for tokens
+    text_excerpt = page.get("text", "")[:15000]
+    payload = {
+        "primary_query": primary_query,
+        "market": market,  # {"hl": "...", "gl": "...", "location": "..."}
+        "page": {
+            "url": page.get("url"),
+            "meta": page.get("meta"),
+            "headings": page.get("headings")[:120],
+            "images": page.get("images")[:60],
+            "json_ld": page.get("json_ld")[:12],
+            "text_excerpt": text_excerpt,
+        },
+        "serp_competitors": serp_compact[:20],  # compact competitor list
+        "instructions": [
+            "Propose concrete additions (tables with column names, diagram types, exact FAQ questions).",
+            "If featured snippet is common, include a 40–60 word definition for the topic.",
+            "Localize style/terminology to the market (hl/gl).",
+            "Return JSON only."
+        ]
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+def ensure_model(model_name: str = "gemini-1.5-pro"):
+    return genai.GenerativeModel(model_name)
+
+def call_gemini(model, system_prompt: str, user_payload: str) -> Dict[str, Any]:
+    schema_hint = json.dumps(recommendation_schema(), ensure_ascii=False)
+    response = model.generate_content(
+        [{"role": "system", "parts": [system_prompt + "\n\nJSON Schema (best effort):\n" + schema_hint]},
+         {"role": "user", "parts": [user_payload]}]
+    )
+    text = (response.text or "").strip()
+    # Parse JSON strictly; try to salvage if extra text sneaks in
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}\s*$", text, flags=re.S)
+        if m:
+            return json.loads(m.group(0))
+        raise RuntimeError("Gemini did not return valid JSON.")
+
+# ----------------------
+# Pipeline
+# ----------------------
+def run(
+    url: str,
+    primary_query: str,
+    hl: Optional[str],
+    gl: Optional[str],
+    location: Optional[str],
+    max_serp: int,
+    model_name: str
+) -> Dict[str, Any]:
+    keys = read_env()
+
+    logging.info("Crawling page…")
+    page = crawl_page(url)
+
+    logging.info("Fetching SERP (global-ready)…")
+    serp_results, serp_features = collect_serp_anywhere(
+        query=primary_query, keys=keys, hl=hl, gl=gl, location=location, num=max_serp
+    )
+
+    # Compact SERP for prompt
+    serp_compact = []
+    for item in serp_results:
+        serp_compact.append({
+            "rank": item.get("position"),
+            "url": item.get("link"),
+            "title": item.get("title"),
+            "snippet": item.get("snippet"),
+        })
+
+    logging.info("Asking Gemini for recommendations…")
+    model = ensure_model(model_name)
+    payload = build_user_payload(
+        page,
+        serp_compact,
+        primary_query,
+        market={"hl": hl, "gl": gl, "location": location}
+    )
+    recs = call_gemini(model, SYSTEM_PROMPT, payload)
+
+    return {
+        "input": {"url": url, "primary_query": primary_query, "hl": hl, "gl": gl, "location": location},
+        "serp_features": serp_features,  # may be None on stub
+        "serp_sample": serp_compact[:max_serp],
+        "recommendations": recs
+    }
+
+def save_output(data: Dict[str, Any], outdir: str = "./output") -> str:
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, "recommendations.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+# ----------------------
+# CLI
+# ----------------------
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Gemini SEO Optimization Agent (global SERP-ready)")
+    ap.add_argument("--url", required=True, help="URL of the page to optimize")
+    ap.add_argument("--query", required=True, help="Primary query to rank for")
+    ap.add_argument("--hl", default=None, help="UI language, e.g. ja, en, de (optional)")
+    ap.add_argument("--gl", default=None, help="Country code, e.g. jp, us, sg, de (optional)")
+    ap.add_argument("--location", default=None, help='City/region, e.g. "Tokyo, Japan" (optional)')
+    ap.add_argument("--max-serp", type=int, default=10, help="How many competitors to fetch")
+    ap.add_argument("--model", default="gemini-1.5-pro", help="Gemini model name")
+    args = ap.parse_args()
+
+    try:
+        result = run(
+            url=args.url,
+            primary_query=args.query,
+            hl=args.hl,
+            gl=args.gl,
+            location=args.location,
+            max_serp=args.max_serp,
+            model_name=args.model
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        out_path = save_output(result)
+        logging.info(f"Wrote {out_path}")
+    except Exception as e:
+        logging.exception(e)
+        raise
